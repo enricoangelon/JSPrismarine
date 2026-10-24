@@ -61,6 +61,7 @@
         { "path": "./packages/nbt/tsconfig.json" },
         { "path": "./packages/prismarine/tsconfig.json" },
         { "path": "./packages/protocol/tsconfig.json" },
+        { "path": "./packages/proxy/tsconfig.json" },
         { "path": "./packages/raknet/tsconfig.json" },
         { "path": "./packages/server/tsconfig.json" }
     ]

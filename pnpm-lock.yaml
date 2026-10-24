@@ -668,6 +668,55 @@ importers:
         specifier: 5.0.1
         version: 5.0.1(@types/node@24.13.6)(@vitest/coverage-v8@5.0.1)(vite@8.3.3(@types/node@24.13.6)(esbuild@0.28.1)(jiti@2.7.0)(tsx@4.23.15)(yaml@2.9.0))
 
+  packages/proxy:
+    dependencies:
+      '@jsprismarine/auth':
+        specifier: workspace:*
+        version: link:../auth
+      '@jsprismarine/client':
+        specifier: workspace:*
+        version: link:../client
+      '@jsprismarine/logger':
+        specifier: workspace:*
+        version: link:../logger
+      '@jsprismarine/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@jsprismarine/raknet':
+        specifier: workspace:*
+        version: link:../raknet
+      yargs:
+        specifier: 18.2.0
+        version: 18.2.0
+    devDependencies:
+      '@jsprismarine/prismarine':
+        specifier: workspace:*
+        version: link:../prismarine
+      '@types/node':
+        specifier: 24.13.6
+        version: 24.13.6
+      '@types/yargs':
+        specifier: 17.0.35
+        version: 17.0.35
+      glob:
+        specifier: 13.0.6
+        version: 13.0.6
+      rimraf:
+        specifier: 6.1.3
+        version: 6.1.3
+      tsx:
+        specifier: 4.23.15
+        version: 4.23.15
+      typescript:
+        specifier: 7.0.2
+        version: 7.0.2
+      vite:
+        specifier: 8.3.3
+        version: 8.3.3(@types/node@24.13.6)(esbuild@0.28.1)(jiti@2.7.0)(tsx@4.23.15)(yaml@2.9.1)
+      vitest:
+        specifier: 5.0.1
+        version: 5.0.1(@types/node@24.13.6)(@vitest/coverage-v8@5.0.1)(vite@8.3.3(@types/node@24.13.6)(esbuild@0.28.1)(jiti@2.7.0)(tsx@4.23.15)(yaml@2.9.1))
+
   packages/raknet:
     dependencies:
       '@jsprismarine/binaryutils':
