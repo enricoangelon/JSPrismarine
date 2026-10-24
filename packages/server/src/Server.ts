@@ -78,6 +78,11 @@ const startServer = async (): Promise<void> => {
             logger.warn(`Cannot start the server, is it already running on the same port?`);
             throw error; // Re-throw it so `process.on` can handle it.
         }
+
+        // The socket and the tick timer are unref'd so an embedding process can exit on its
+        // own, and without a TTY the console never holds stdin open either. Headless, as in
+        // a container, nothing would keep the event loop alive. `shutdown` exits explicitly.
+        setInterval(() => {}, 2 ** 31 - 1);
     };
 
     void bootstrap();
