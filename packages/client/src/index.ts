@@ -8,6 +8,7 @@ import BreakBehavior from './bot/behavior/BreakBehavior';
 import ChatBehavior from './bot/behavior/ChatBehavior';
 import LookBehavior from './bot/behavior/LookBehavior';
 import WalkBehavior from './bot/behavior/WalkBehavior';
+import { deriveEncryptionKey, readHandshake } from './login/Handshake';
 import LoginSequence, { LoginStage } from './login/LoginSequence';
 import ClientPacketRegistry from './net/ClientPacketRegistry';
 import ClientSession from './net/ClientSession';
@@ -36,7 +37,9 @@ export {
     TICK_INTERVAL_MS,
     WalkBehavior,
     createBehaviors,
-    formatReport
+    deriveEncryptionKey,
+    formatReport,
+    readHandshake
 };
 
 export default Client;
