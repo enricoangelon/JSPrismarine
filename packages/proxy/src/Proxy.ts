@@ -6,21 +6,26 @@ import PacketRecorder from './PacketRecorder';
 import ProxySession from './ProxySession';
 
 import type { InetAddress, Protocol, RakNetSession } from '@jsprismarine/raknet';
-import type { BackendAddress } from './ProxySession';
+import type { BackendAddress } from './BackendConnection';
 
 /** How a proxy is set up. */
 export interface ProxyOptions {
     /** The address clients connect to. */
     readonly listen: { readonly host: string; readonly port: number };
-    /** The server every client is relayed to. */
+    /** The server every client is relayed to and plays on. */
     readonly backend: BackendAddress;
+    /**
+     * A second server that gets the same client packets at the same time, for comparing its
+     * answers with the backend's. What it sends is recorded and never reaches the client.
+     */
+    readonly mirror?: BackendAddress;
     /** A directory to write one NDJSON recording per player into; omit it to record nothing. */
     readonly recordDir?: string;
     /** Shown in the client's server list. */
     readonly motd?: string;
     readonly maxPlayers?: number;
     readonly logger?: Logger;
-    /** How long the backend gets to accept each RakNet connection. */
+    /** How long each backend gets to accept a RakNet connection. */
     readonly connectTimeoutMs?: number;
 }
 
@@ -39,11 +44,16 @@ const recordingName = (address: InetAddress): string =>
  * against JSPrismarine and against a Bedrock Dedicated Server with `online-mode=false`, and
  * the recordings hold what a real client sends, which nothing else in the repository captures.
  *
+ * With a mirror, the same client packets also go to a second server, and both servers'
+ * answers land in one recording on one clock. Playing on a Bedrock Dedicated Server with
+ * JSPrismarine as the mirror shows what each sends in answer to the same input.
+ *
  * @example
  * ```typescript
  * const proxy = new Proxy({
  *     listen: { host: '0.0.0.0', port: 19132 },
  *     backend: { host: '127.0.0.1', port: 19133 },
+ *     mirror: { host: '127.0.0.1', port: 19134 },
  *     recordDir: 'captures'
  * });
  * proxy.start();
@@ -90,8 +100,12 @@ export default class Proxy {
         socket.start(host, port);
         this.socket = socket;
 
-        const { backend } = this.options;
-        this.logger.info(`Listening on ${host}:${port}, relaying to ${backend.host}:${backend.port}`);
+        const { backend, mirror } = this.options;
+        this.logger.info(
+            `Listening on ${host}:${port}, relaying to ${backend.host}:${backend.port}${
+                mirror === undefined ? '' : `, mirroring to ${mirror.host}:${mirror.port}`
+            }`
+        );
     }
 
     /** Disconnects every player and closes the listening socket. */
@@ -109,20 +123,22 @@ export default class Proxy {
     private onOpen(session: RakNetSession): void {
         const address = session.getAddress();
         const token = address.toToken();
-        const { backend, recordDir } = this.options;
+        const { backend, mirror, recordDir } = this.options;
 
         const recorder =
             recordDir === undefined
                 ? null
                 : PacketRecorder.open(path.join(recordDir, recordingName(address)), {
                       client: token,
-                      backend: `${backend.host}:${backend.port}`
+                      backend: `${backend.host}:${backend.port}`,
+                      mirror: mirror === undefined ? null : `${mirror.host}:${mirror.port}`
                   });
 
         this.sessions.set(
             token,
             new ProxySession(session, {
                 backend,
+                mirror,
                 logger: this.logger,
                 recorder,
                 connectTimeoutMs: this.options.connectTimeoutMs,

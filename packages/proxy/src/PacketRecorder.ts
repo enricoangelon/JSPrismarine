@@ -9,8 +9,14 @@ import type { WriteStream } from 'node:fs';
 /** Which way a recorded packet went. Serverbound is toward the backend. */
 export type PacketDirection = 'serverbound' | 'clientbound';
 
-/** Bumped whenever a field of a recorded line changes meaning. */
-export const RECORDING_FORMAT_VERSION = 1;
+/**
+ * Which backend a recorded packet was exchanged with: the one the client plays on, or the
+ * mirror that gets the same client packets for comparison.
+ */
+export type BackendRole = 'primary' | 'mirror';
+
+/** Bumped whenever a field of a recorded line changes meaning. 2 added the backend role. */
+export const RECORDING_FORMAT_VERSION = 2;
 
 /** The first line of a recording. */
 export interface RecordingHeader {
@@ -20,8 +26,10 @@ export interface RecordingHeader {
     readonly startedAt: string;
     /** The client's address, `host:port`. */
     readonly client: string;
-    /** The backend's address, `host:port`. */
+    /** The primary backend's address, `host:port`. */
     readonly backend: string;
+    /** The mirror's address, `host:port`, or null when nothing was mirrored. */
+    readonly mirror: string | null;
 }
 
 /** Every line after the header: one packet. */
@@ -30,6 +38,7 @@ export interface RecordedPacket {
     /** Milliseconds since the recording started. */
     readonly t: number;
     readonly direction: PacketDirection;
+    readonly backend: BackendRole;
     readonly id: number;
     /** The `PacketIdentifier` name, or null for an id the protocol package does not name yet. */
     readonly name: string | null;
@@ -40,19 +49,21 @@ export interface RecordedPacket {
 }
 
 /**
- * Writes one player's conversation with the backend to an NDJSON file.
+ * Writes one player's conversation with the backends to an NDJSON file.
  *
- * It records what the backend sent and received, which is what a replay needs: the login is
+ * It records what each backend sent and received, which is what a replay needs: the login is
  * the one the proxy signed, and the encryption handshake that the client never sees is in it.
- * Payloads are decompressed and decrypted but otherwise exactly as they were on the wire.
+ * Payloads are decompressed and decrypted but otherwise exactly as they were on the wire. Both
+ * backends share one clock, so `t` says what each of them sent at the same moment.
  *
  * @example
  * ```typescript
  * const recorder = PacketRecorder.open('captures/session.ndjson', {
  *     client: '127.0.0.1:50123',
- *     backend: '127.0.0.1:19133'
+ *     backend: '127.0.0.1:19133',
+ *     mirror: '127.0.0.1:19134'
  * });
- * recorder.record('serverbound', packet);
+ * recorder.record('serverbound', 'primary', packet);
  * await recorder.close();
  * ```
  */
@@ -69,7 +80,7 @@ export default class PacketRecorder {
      * whatever is recorded while the file is still opening.
      * @param file - where to write; an existing file is replaced.
      */
-    public static open(file: string, session: Pick<RecordingHeader, 'client' | 'backend'>): PacketRecorder {
+    public static open(file: string, session: Pick<RecordingHeader, 'client' | 'backend' | 'mirror'>): PacketRecorder {
         mkdirSync(path.dirname(file), { recursive: true });
 
         const recorder = new PacketRecorder(createWriteStream(file));
@@ -84,7 +95,7 @@ export default class PacketRecorder {
     }
 
     /** Appends one packet, header included. Ignored once the recorder is closed. */
-    public record(direction: PacketDirection, packet: Buffer): void {
+    public record(direction: PacketDirection, backend: BackendRole, packet: Buffer): void {
         if (this.closed) return;
 
         const id = ClientPacketRegistry.readPacketId(packet);
@@ -93,6 +104,7 @@ export default class PacketRecorder {
             type: 'packet',
             t: Math.round((performance.now() - this.startedAt) * 1000) / 1000,
             direction,
+            backend,
             id,
             name: PacketIdentifier[id] ?? null,
             size: packet.byteLength,

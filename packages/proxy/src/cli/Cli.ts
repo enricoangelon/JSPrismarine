@@ -89,6 +89,12 @@ export const run = async (
             })
             .options({
                 backend: { alias: 'b', type: 'string', demandOption: true, describe: 'Server to relay to, host:port' },
+                mirror: {
+                    alias: 'm',
+                    type: 'string',
+                    describe:
+                        'Second server that gets the same client packets, host:port; its replies are only recorded'
+                },
                 listen: {
                     alias: 'l',
                     type: 'string',
@@ -113,9 +119,11 @@ export const run = async (
     if (values.help === true || values.version === true) return 0;
 
     let backend: Address;
+    let mirror: Address | undefined;
     let listen: Address;
     try {
         backend = parseAddress(values.backend, '--backend');
+        mirror = values.mirror === undefined ? undefined : parseAddress(values.mirror, '--mirror');
         listen = parseAddress(values.listen, '--listen');
     } catch (error: unknown) {
         io.err(error instanceof Error ? error.message : String(error));
@@ -125,6 +133,7 @@ export const run = async (
     const proxy = new Proxy({
         listen,
         backend,
+        mirror,
         recordDir: values.record,
         motd: values.motd,
         logger: new Logger(values.verbose === true ? 'silly' : 'info')

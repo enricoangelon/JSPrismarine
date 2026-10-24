@@ -26,13 +26,17 @@ const readLines = (file: string): any[] =>
 describe('PacketRecorder', () => {
     it('writes a header line and then one line per packet', async () => {
         const file = recordingFile();
-        const recorder = PacketRecorder.open(file, { client: '127.0.0.1:50000', backend: '127.0.0.1:19133' });
+        const recorder = PacketRecorder.open(file, {
+            client: '127.0.0.1:50000',
+            backend: '127.0.0.1:19133',
+            mirror: '127.0.0.1:19134'
+        });
 
         // RequestNetworkSettings (0xc1) needs two header bytes, which is what readPacketId is for.
         const request = Buffer.from([0xc1, 0x01, 0x00, 0x00, 0x08, 0x91]);
         const playStatus = Buffer.from([0x02, 0x00, 0x00, 0x00, 0x00]);
-        recorder.record('serverbound', request);
-        recorder.record('clientbound', playStatus);
+        recorder.record('serverbound', 'primary', request);
+        recorder.record('clientbound', 'mirror', playStatus);
         await recorder.close();
 
         const [header, first, second] = readLines(file);
@@ -41,7 +45,8 @@ describe('PacketRecorder', () => {
             type: 'session',
             format: RECORDING_FORMAT_VERSION,
             client: '127.0.0.1:50000',
-            backend: '127.0.0.1:19133'
+            backend: '127.0.0.1:19133',
+            mirror: '127.0.0.1:19134'
         });
         expect(Number.isNaN(Date.parse(header.startedAt))).toBe(false);
 
@@ -54,15 +59,15 @@ describe('PacketRecorder', () => {
         });
         expect(Buffer.from(first.payload, 'base64')).toEqual(request);
 
-        expect(second).toMatchObject({ direction: 'clientbound', id: 0x02, name: 'PLAY_STATUS' });
+        expect(second).toMatchObject({ direction: 'clientbound', backend: 'mirror', id: 0x02, name: 'PLAY_STATUS' });
         expect(second.t).toBeGreaterThanOrEqual(first.t);
     });
 
     it('names an id the protocol package does not know as null', async () => {
         const file = recordingFile();
-        const recorder = PacketRecorder.open(file, { client: 'a:1', backend: 'b:2' });
+        const recorder = PacketRecorder.open(file, { client: 'a:1', backend: 'b:2', mirror: null });
 
-        recorder.record('clientbound', Buffer.from([0x7f]));
+        recorder.record('clientbound', 'primary', Buffer.from([0x7f]));
         await recorder.close();
 
         expect(readLines(file)[1]).toMatchObject({ id: 0x7f, name: null });
@@ -70,10 +75,10 @@ describe('PacketRecorder', () => {
 
     it('ignores packets recorded after it was closed', async () => {
         const file = recordingFile();
-        const recorder = PacketRecorder.open(file, { client: 'a:1', backend: 'b:2' });
+        const recorder = PacketRecorder.open(file, { client: 'a:1', backend: 'b:2', mirror: null });
         await recorder.close();
 
-        expect(() => recorder.record('clientbound', Buffer.from([0x02]))).not.toThrow();
+        expect(() => recorder.record('clientbound', 'primary', Buffer.from([0x02]))).not.toThrow();
         await recorder.close();
 
         expect(readLines(file)).toHaveLength(1);

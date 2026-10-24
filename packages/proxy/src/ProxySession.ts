@@ -1,76 +1,62 @@
-import {
-    ClientPacketRegistry,
-    RakNetTransport,
-    SendPriority,
-    deriveEncryptionKey,
-    readHandshake
-} from '@jsprismarine/client';
-import {
-    ClientToServerHandshakePacket,
-    DisconnectPacket,
-    LoginPacket,
-    NetworkBinaryStream,
-    NetworkSettingsPacket,
-    PacketIdentifier,
-    ServerToClientHandshakePacket
-} from '@jsprismarine/protocol';
+import { ClientPacketRegistry, SendPriority } from '@jsprismarine/client';
+import { DisconnectPacket, LoginPacket, NetworkBinaryStream, PacketIdentifier } from '@jsprismarine/protocol';
 import { ConnectionPriority, Protocol } from '@jsprismarine/raknet';
+import BackendConnection, { readCompression } from './BackendConnection';
 import Link from './Link';
 import { MAX_DISPLAY_NAME_LENGTH, createRelayAuth, readRelayedLogin } from './LoginRelay';
 
 import type { Logger } from '@jsprismarine/logger';
-import type { NetworkPacket } from '@jsprismarine/protocol';
 import type { RakNetSession } from '@jsprismarine/raknet';
+import type { BackendAddress } from './BackendConnection';
+import type { BackendRole } from './PacketRecorder';
 import type PacketRecorder from './PacketRecorder';
-import type { PacketDirection } from './PacketRecorder';
-
-/** Where a proxy sends its players. */
-export interface BackendAddress {
-    readonly host: string;
-    readonly port: number;
-}
 
 /** What a session needs from the proxy that owns it. */
 export interface ProxySessionOptions {
+    /** The server the client plays on. */
     readonly backend: BackendAddress;
+    /**
+     * A second server that gets the same client packets, for comparing with the first. What it
+     * sends back is recorded and never reaches the client.
+     */
+    readonly mirror?: BackendAddress;
     readonly logger: Logger;
-    /** Receives every packet exchanged with the backend; null records nothing. */
+    /** Receives every packet exchanged with either backend; null records nothing. */
     readonly recorder: PacketRecorder | null;
-    /** How long the backend gets to accept the RakNet connection. */
+    /** How long each backend gets to accept the RakNet connection. */
     readonly connectTimeoutMs?: number;
-    /** Called once, after both connections are closed. */
+    /** Called once, after every connection is closed. */
     readonly onClose?: (reason: string) => void;
 }
 
 /** The DisconnectPacket reason the proxy sends when the backend could not be reached. */
 const DISCONNECT_REASON_UNKNOWN = 0;
 
-const serialize = (packet: NetworkPacket<unknown>): Buffer => packet.serialize(new NetworkBinaryStream());
-
 /**
- * One player passing through the proxy: the connection from the client and the one to the backend.
+ * One player passing through the proxy: the connection from the client, the one to the backend
+ * it plays on, and optionally one to a mirror.
  *
  * Everything is forwarded as it arrived, batch for batch, apart from the steps each connection
  * has to negotiate on its own:
  *
- * - `RequestNetworkSettings` from the client opens the backend connection, and goes on to the
- *   backend unchanged. The backend's `NetworkSettings` goes back to the client unchanged, and
- *   both links switch to the compression it names.
+ * - `RequestNetworkSettings` from the client opens the backend connections, and goes on to each
+ *   of them unchanged. The primary backend's `NetworkSettings` goes back to the client
+ *   unchanged, and the client link switches to the compression it names.
  * - `Login` is signed again, by an offline identity carrying the client's name, uuid and
- *   client data. The proxy cannot reuse the client's signature: the backend encrypts against
- *   the key in the login, and only the client holds that key's private half.
+ *   client data. The proxy cannot reuse the client's signature: a backend encrypts against the
+ *   key in the login, and only the client holds that key's private half.
  * - `ServerToClientHandshake` is answered by the proxy and not forwarded. The client link
  *   stays unencrypted, which the client accepts from any server that does not ask for it.
+ *
+ * The mirror is best effort. If it cannot be reached or drops out, the player keeps playing on
+ * the primary backend and the proxy logs why.
  */
 export default class ProxySession {
     private readonly client: Link;
-    private backend: Link | null = null;
-    private transport: RakNetTransport | null = null;
+    private primary: BackendConnection | null = null;
+    private mirror: BackendConnection | null = null;
 
-    /** The private key of the identity the backend login was signed with, once there is one. */
-    private privateKey: string | null = null;
-
-    /** Serverbound batches, one after another, because opening the backend and signing the login are asynchronous. */
+    /** Serverbound batches, one after another, because opening backends and signing logins are asynchronous. */
     private serverbound: Promise<void> = Promise.resolve();
     /** Set once the backend's own `Disconnect` has been passed on, so the proxy does not add a second. */
     private disconnectForwarded = false;
@@ -94,13 +80,13 @@ export default class ProxySession {
         this.client.receive(payload);
     }
 
-    /** Closes the backend connection after the client has gone. */
+    /** Closes the backend connections after the client has gone. */
     public onClientClosed(reason: string): void {
         this.finish(`client left: ${reason}`);
     }
 
     /**
-     * Ends both connections.
+     * Ends every connection.
      *
      * The client is sent a `Disconnect` carrying the reason, because a RakNet disconnect on its
      * own leaves the game showing a generic message that says nothing about the backend.
@@ -110,14 +96,12 @@ export default class ProxySession {
         this.closing = true;
 
         if (!this.disconnectForwarded) {
-            this.client.send(
-                [
-                    serialize(
-                        new DisconnectPacket({ reason: DISCONNECT_REASON_UNKNOWN, skipMessage: false, message: reason })
-                    )
-                ],
-                SendPriority.IMMEDIATE
-            );
+            const disconnect = new DisconnectPacket({
+                reason: DISCONNECT_REASON_UNKNOWN,
+                skipMessage: false,
+                message: reason
+            });
+            this.client.send([disconnect.serialize(new NetworkBinaryStream())], SendPriority.IMMEDIATE);
         }
         await this.client.flush();
 
@@ -129,7 +113,8 @@ export default class ProxySession {
         if (this.closed) return;
         this.closed = true;
 
-        this.transport?.close(reason);
+        this.primary?.close(reason);
+        this.mirror?.close(reason);
         void this.options.recorder?.close();
         this.options.onClose?.(reason);
     }
@@ -149,69 +134,89 @@ export default class ProxySession {
 
     private onClientPackets(packets: Buffer[]): void {
         this.serverbound = this.serverbound
-            .then(() => this.forwardToBackend(packets))
+            .then(() => this.forwardToBackends(packets))
             .catch(async (error: unknown) => {
                 await this.close(`Proxy error: ${error instanceof Error ? error.message : String(error)}`);
             });
     }
 
-    private async forwardToBackend(packets: Buffer[]): Promise<void> {
+    private async forwardToBackends(packets: Buffer[]): Promise<void> {
         if (this.closed) return;
 
-        const forwarded: Buffer[] = [];
+        // Built per backend, because each one gets a login signed for its own address.
+        const toPrimary: Buffer[] = [];
+        const toMirror: Buffer[] = [];
 
         for (const packet of packets) {
             const id = ClientPacketRegistry.readPacketId(packet);
 
-            if (id === PacketIdentifier.REQUEST_NETWORK_SETTINGS && this.backend === null) {
-                await this.connectBackend();
-                forwarded.push(packet);
-            } else if (id === PacketIdentifier.LOGIN) {
-                forwarded.push(await this.relayLogin(packet));
+            if (id === PacketIdentifier.REQUEST_NETWORK_SETTINGS && this.primary === null) {
+                await this.connectBackends();
+            }
+
+            if (id === PacketIdentifier.LOGIN) {
+                const [forPrimary, forMirror] = await this.relayLogin(packet);
+                toPrimary.push(forPrimary);
+                if (forMirror !== null) toMirror.push(forMirror);
             } else {
-                forwarded.push(packet);
+                toPrimary.push(packet);
+                toMirror.push(packet);
             }
         }
 
-        if (this.backend === null) {
-            throw new Error('The client did not start with RequestNetworkSettings');
-        }
+        if (this.primary === null) throw new Error('The client did not start with RequestNetworkSettings');
 
-        this.sendToBackend(forwarded, SendPriority.NORMAL);
+        this.primary.send(toPrimary);
+        this.mirror?.send(toMirror);
     }
 
-    private async connectBackend(): Promise<void> {
-        const { host, port } = this.options.backend;
-        const transport = new RakNetTransport(this.options.logger, {
-            host,
-            port,
-            timeoutMs: this.options.connectTimeoutMs
-        });
-        const backend = new Link(
-            'backend',
-            (payload, priority) => transport.send(payload, priority),
-            (packets) => this.onBackendPackets(packets),
-            this.options.logger
-        );
+    private async connectBackends(): Promise<void> {
+        const primary = this.createConnection('primary', this.options.backend);
+        const mirror = this.options.mirror === undefined ? null : this.createConnection('mirror', this.options.mirror);
 
-        transport.on('batch', (payload) => backend.receive(payload));
-        transport.on('close', (reason) => void this.close(`The backend closed the connection: ${reason}`));
+        const [primaryResult, mirrorResult] = await Promise.allSettled([primary.connect(), mirror?.connect()]);
 
-        this.transport = transport;
+        if (primaryResult.status === 'rejected') {
+            mirror?.close('the primary backend is unreachable');
+            throw primaryResult.reason;
+        }
+        this.primary = primary;
 
-        try {
-            await transport.connect();
-        } catch (error: unknown) {
-            throw new Error(
-                `Cannot reach the backend at ${host}:${port}: ${error instanceof Error ? error.message : String(error)}`
+        if (mirror === null) return;
+        if (mirrorResult.status === 'rejected') {
+            this.options.logger.warn(
+                `${mirrorResult.reason instanceof Error ? mirrorResult.reason.message : String(mirrorResult.reason)}; continuing without a mirror`
             );
+            mirror.close('unreachable');
+            return;
         }
-
-        this.backend = backend;
-        this.options.logger.debug(`Connected to the backend at ${host}:${port}`);
+        this.mirror = mirror;
     }
 
-    private async relayLogin(packet: Buffer): Promise<Buffer> {
+    private createConnection(role: BackendRole, address: BackendAddress): BackendConnection {
+        return new BackendConnection({
+            role,
+            address,
+            logger: this.options.logger,
+            recorder: this.options.recorder,
+            connectTimeoutMs: this.options.connectTimeoutMs,
+            onPackets: role === 'primary' ? (packets) => this.forwardToClient(packets) : () => {},
+            onClose: (reason) => this.onBackendClosed(role, reason)
+        });
+    }
+
+    private onBackendClosed(role: BackendRole, reason: string): void {
+        if (role === 'primary') {
+            void this.close(`The backend closed the connection: ${reason}`);
+            return;
+        }
+
+        if (this.closed) return;
+        this.mirror = null;
+        this.options.logger.warn(`The mirror closed the connection (${reason}); continuing without it`);
+    }
+
+    private async relayLogin(packet: Buffer): Promise<[Buffer, Buffer | null]> {
         const relayed = readRelayedLogin(new LoginPacket().deserialize(new NetworkBinaryStream(packet)));
 
         if (relayed.displayName.length > MAX_DISPLAY_NAME_LENGTH) {
@@ -220,78 +225,42 @@ export default class ProxySession {
             );
         }
 
+        const primary = this.primary;
+        if (primary === null) throw new Error('The client logged in before RequestNetworkSettings');
+
+        // One identity for both backends, so both know the player by the same uuid.
         const auth = createRelayAuth(relayed);
-        // Read now rather than when the handshake arrives: the key has to be derived inside the
-        // backend link's inbound chain, before the encrypted batch behind the handshake is read.
-        this.privateKey = await auth.getIdentityPrivateKey();
+        const forPrimary = await primary.createLogin(relayed, auth);
+        const forMirror = (await this.mirror?.createLogin(relayed, auth)) ?? null;
 
-        const { host, port } = this.options.backend;
-        const credentials = await auth.createLoginCredentials({
-            serverAddress: `${host}:${port}`,
-            protocolVersion: relayed.protocolVersion
-        });
-
-        this.options.logger.info(`Relaying ${relayed.displayName} to ${host}:${port}`);
-
-        return serialize(
-            new LoginPacket({
-                protocolVersion: relayed.protocolVersion,
-                chainData: credentials.chainData,
-                clientData: credentials.clientData
-            })
+        this.options.logger.info(
+            `Relaying ${relayed.displayName} to ${primary.getAddress()}${
+                this.mirror === null ? '' : `, mirrored to ${this.mirror.getAddress()}`
+            }`
         );
+
+        return [forPrimary, forMirror];
     }
 
-    private sendToBackend(packets: readonly Buffer[], priority: SendPriority): void {
-        for (const packet of packets) this.record('serverbound', packet);
-        this.backend?.send(packets, priority);
-    }
-
-    private onBackendPackets(packets: Buffer[]): void {
+    private forwardToClient(packets: Buffer[]): void {
         let forwarded: Buffer[] = [];
 
         for (const packet of packets) {
-            this.record('clientbound', packet);
-
             const id = ClientPacketRegistry.readPacketId(packet);
 
             if (id === PacketIdentifier.NETWORK_SETTINGS) {
-                const settings = new NetworkSettingsPacket().deserialize(new NetworkBinaryStream(packet));
-                const compression = {
-                    algorithm: settings.compressionAlgorithm,
-                    threshold: settings.compressionThreshold
-                };
-
-                this.backend?.enableCompression(compression);
-
                 // Sent before the client link switches over, because NetworkSettings itself
                 // travels uncompressed and the client expects compression from the next batch.
                 this.client.send([...forwarded, packet], SendPriority.IMMEDIATE);
                 forwarded = [];
-                this.client.enableCompression(compression);
-            } else if (id === PacketIdentifier.SERVER_TO_CLIENT_HANDSHAKE) {
-                this.answerHandshake(packet);
-            } else {
-                if (id === PacketIdentifier.DISCONNECT) this.disconnectForwarded = true;
-                forwarded.push(packet);
+                this.client.enableCompression(readCompression(packet));
+                continue;
             }
+
+            if (id === PacketIdentifier.DISCONNECT) this.disconnectForwarded = true;
+            forwarded.push(packet);
         }
 
         this.client.send(forwarded);
-    }
-
-    private answerHandshake(packet: Buffer): void {
-        if (this.privateKey === null) throw new Error('The backend asked for encryption before the login');
-
-        const { jwt } = new ServerToClientHandshakePacket().deserialize(new NetworkBinaryStream(packet));
-        const { publicKeyDer, salt } = readHandshake(jwt);
-
-        this.backend?.enableEncryption(deriveEncryptionKey(this.privateKey, publicKeyDer, salt));
-        // Encrypted, like every batch after the handshake.
-        this.sendToBackend([serialize(new ClientToServerHandshakePacket({}))], SendPriority.IMMEDIATE);
-    }
-
-    private record(direction: PacketDirection, packet: Buffer): void {
-        this.options.recorder?.record(direction, packet);
     }
 }
