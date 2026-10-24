@@ -119,6 +119,34 @@ describe('OfflineAuthProvider', () => {
         expect(Buffer.from(data.SkinData, 'base64')).toHaveLength(SKIN_WIDTH * SKIN_HEIGHT * 4);
         expect(JSON.parse(Buffer.from(data.SkinResourcePatch, 'base64').toString())).toHaveProperty('geometry');
     });
+
+    it("sends a relayed client's data as it is, apart from the fields tied to this login", async () => {
+        const auth = new OfflineAuthProvider({
+            displayName: 'Steve',
+            identity: '11111111-2222-3333-4444-555555555555',
+            clientDataPayload: {
+                PersonaSkin: true,
+                PersonaPieces: [{ PieceId: 'piece' }],
+                SkinId: 'relayed-skin',
+                DeviceOS: 1,
+                ServerAddress: 'proxy.example:19132',
+                SelfSignedId: 'not-this-identity',
+                ThirdPartyName: 'NotSteve'
+            }
+        });
+        const data = decode((await auth.createLoginCredentials(REQUEST)).clientData);
+
+        expect(data.PersonaSkin).toBe(true);
+        expect(data.PersonaPieces).toEqual([{ PieceId: 'piece' }]);
+        expect(data.SkinId).toBe('relayed-skin');
+        expect(data.DeviceOS).toBe(1);
+        // A field the relayed payload leaves out still gets the generated value.
+        expect(data).toHaveProperty('SkinResourcePatch');
+
+        expect(data.ServerAddress).toBe(REQUEST.serverAddress);
+        expect(data.SelfSignedId).toBe('11111111-2222-3333-4444-555555555555');
+        expect(data.ThirdPartyName).toBe('Steve');
+    });
 });
 
 describe('the generated skin', () => {

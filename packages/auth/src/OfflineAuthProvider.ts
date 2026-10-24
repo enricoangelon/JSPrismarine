@@ -1,6 +1,6 @@
 import { createSigner } from 'fast-jwt';
 import { generateKeyPairSync, randomInt, randomUUID } from 'node:crypto';
-import type { ClientDataOptions } from './ClientData';
+import type { ClientDataOptions, ClientDataPayload } from './ClientData';
 import { createClientData } from './ClientData';
 
 import type { IAuthProvider, Identity, LoginCredentials, LoginRequest } from './IAuthProvider';
@@ -44,6 +44,16 @@ export interface OfflineAuthOptions {
      */
     readonly identity?: string;
     readonly clientData?: Partial<ClientDataOptions>;
+    /**
+     * Client data fields to send as they are, over the generated ones.
+     *
+     * For a proxy that re-signs a real client's login. That client's skin, persona pieces and
+     * device fields are already in this shape, and {@link clientData} can only describe the
+     * generated default skin. `ServerAddress`, `SelfSignedId` and `ThirdPartyName` are still
+     * written by this provider, so they agree with the address being dialled and with the
+     * identity the token carries.
+     */
+    readonly clientDataPayload?: Partial<ClientDataPayload>;
 }
 
 /**
@@ -203,14 +213,18 @@ export default class OfflineAuthProvider implements IAuthProvider {
             noTimestamp: true
         });
 
-        return sign(
-            createClientData({
+        return sign({
+            ...createClientData({
                 ...this.options.clientData,
                 serverAddress: request.serverAddress,
                 clientRandomId: this.clientRandomId,
                 selfSignedId: this.identity.identity,
                 displayName: this.identity.displayName
-            })
-        );
+            }),
+            ...this.options.clientDataPayload,
+            ServerAddress: request.serverAddress,
+            SelfSignedId: this.identity.identity,
+            ThirdPartyName: this.identity.displayName
+        });
     }
 }
